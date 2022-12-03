@@ -108,6 +108,9 @@
 #define GLFW_HAS_GAMEPAD_API            (GLFW_VERSION_COMBINED >= 3300) // 3.3+ glfwGetGamepadState() new api
 #define GLFW_HAS_GETKEYNAME             (GLFW_VERSION_COMBINED >= 3200) // 3.2+ glfwGetKeyName()
 
+#include "glfwim/input_manager.h"
+using namespace glfwim;
+
 // GLFW data
 enum GlfwClientApi
 {
@@ -141,9 +144,25 @@ struct ImGui_ImplGlfw_Data
     GLFWcharfun             PrevUserCallbackChar;
     GLFWmonitorfun          PrevUserCallbackMonitor;
 
+    // Store per frame input infos
+    PerFrameGlobalInputData* input;
+
     ImGui_ImplGlfw_Data()   { memset((void*)this, 0, sizeof(*this)); }
 };
 
+// Helper structure we store in the void* RenderUserData field of each ImGuiViewport to easily retrieve our backend data.
+struct ImGui_ImplGlfw_ViewportData
+{
+    GLFWwindow* Window;
+    bool        WindowOwned;
+    int         IgnoreWindowPosEventFrame;
+    int         IgnoreWindowSizeEventFrame;
+
+    InputManager* MyInputManager;
+
+    ImGui_ImplGlfw_ViewportData() { Window = nullptr; WindowOwned = false; IgnoreWindowSizeEventFrame = IgnoreWindowPosEventFrame = -1; }
+    ~ImGui_ImplGlfw_ViewportData() { IM_ASSERT(Window == nullptr); }
+};
 // Backend data stored in io.BackendPlatformUserData to allow support for multiple Dear ImGui contexts
 // It is STRONGLY preferred that you use docking branch with multi-viewports (== single Dear ImGui context + multiple windows) instead of multiple Dear ImGui contexts.
 // FIXME: multi-context support is not well tested and probably dysfunctional in this backend.
@@ -164,12 +183,15 @@ static void ImGui_ImplGlfw_ShutdownPlatformInterface();
 // Functions
 static const char* ImGui_ImplGlfw_GetClipboardText(void* user_data)
 {
-    return glfwGetClipboardString((GLFWwindow*)user_data);
+    auto bd = ImGui_ImplGlfw_GetBackendData();
+    return bd->input->clipBoardString.c_str();
 }
 
 static void ImGui_ImplGlfw_SetClipboardText(void* user_data, const char* text)
 {
-    glfwSetClipboardString((GLFWwindow*)user_data, text);
+    theInputManager.executeOn([str = std::string{text}, w = (GLFWwindow*)user_data]() {
+        glfwSetClipboardString(w, str.c_str());
+    });
 }
 
 static ImGuiKey ImGui_ImplGlfw_KeyToImGuiKey(int key)
@@ -380,7 +402,8 @@ void ImGui_ImplGlfw_KeyCallback(GLFWwindow* window, int keycode, int scancode, i
     if (keycode >= 0 && keycode < IM_ARRAYSIZE(bd->KeyOwnerWindows))
         bd->KeyOwnerWindows[keycode] = (action == GLFW_PRESS) ? window : nullptr;
 
-    keycode = ImGui_ImplGlfw_TranslateUntranslatedKey(keycode, scancode);
+    // TODO: we cant do this here as we are not on the main thread
+    //keycode = ImGui_ImplGlfw_TranslateUntranslatedKey(keycode, scancode);
 
     ImGuiIO& io = ImGui::GetIO();
     ImGuiKey imgui_key = ImGui_ImplGlfw_KeyToImGuiKey(keycode);
@@ -403,14 +426,14 @@ void ImGui_ImplGlfw_CursorPosCallback(GLFWwindow* window, double x, double y)
     ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
     if (bd->PrevUserCallbackCursorPos != nullptr && window == bd->Window)
         bd->PrevUserCallbackCursorPos(window, x, y);
-    if (glfwGetInputMode(window, GLFW_CURSOR) == GLFW_CURSOR_DISABLED)
+    if (bd->input->inputModeCursor == GLFW_CURSOR_DISABLED)
         return;
 
     ImGuiIO& io = ImGui::GetIO();
     if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
     {
-        int window_x, window_y;
-        glfwGetWindowPos(window, &window_x, &window_y);
+        int window_x = bd->input->viewportData[window].posX;
+        int window_y = bd->input->viewportData[window].posY;
         x += window_x;
         y += window_y;
     }
@@ -425,7 +448,7 @@ void ImGui_ImplGlfw_CursorEnterCallback(GLFWwindow* window, int entered)
     ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
     if (bd->PrevUserCallbackCursorEnter != nullptr && window == bd->Window)
         bd->PrevUserCallbackCursorEnter(window, entered);
-    if (glfwGetInputMode(window, GLFW_CURSOR) == GLFW_CURSOR_DISABLED)
+    if (bd->input->inputModeCursor == GLFW_CURSOR_DISABLED)
         return;
 
     ImGuiIO& io = ImGui::GetIO();
@@ -521,6 +544,9 @@ static bool ImGui_ImplGlfw_Init(GLFWwindow* window, bool install_callbacks, Glfw
     bd->Time = 0.0;
     bd->WantUpdateMonitors = true;
 
+    bd->input = new PerFrameGlobalInputData{};
+    theInputManager.fillInputState(bd->input);
+
     io.SetClipboardTextFn = ImGui_ImplGlfw_SetClipboardText;
     io.GetClipboardTextFn = ImGui_ImplGlfw_GetClipboardText;
     io.ClipboardUserData = bd->Window;
@@ -557,7 +583,7 @@ static bool ImGui_ImplGlfw_Init(GLFWwindow* window, bool install_callbacks, Glfw
 
     // Update monitors the first time (note: monitor callback are broken in GLFW 3.2 and earlier, see github.com/glfw/glfw/issues/784)
     ImGui_ImplGlfw_UpdateMonitors();
-    glfwSetMonitorCallback(ImGui_ImplGlfw_MonitorCallback);
+    //glfwSetMonitorCallback(ImGui_ImplGlfw_MonitorCallback);
 
     // Our mouse update function expect PlatformHandle to be filled for the main viewport
     ImGuiViewport* main_viewport = ImGui::GetMainViewport();
@@ -605,6 +631,7 @@ void ImGui_ImplGlfw_Shutdown()
 
     io.BackendPlatformName = nullptr;
     io.BackendPlatformUserData = nullptr;
+    delete bd->input;
     IM_DELETE(bd);
 }
 
@@ -614,7 +641,7 @@ static void ImGui_ImplGlfw_UpdateMouseData()
     ImGuiIO& io = ImGui::GetIO();
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
 
-    if (glfwGetInputMode(bd->Window, GLFW_CURSOR) == GLFW_CURSOR_DISABLED)
+    if (bd->input->inputModeCursor == GLFW_CURSOR_DISABLED)
     {
         io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
         return;
@@ -630,26 +657,29 @@ static void ImGui_ImplGlfw_UpdateMouseData()
 #ifdef __EMSCRIPTEN__
         const bool is_window_focused = true;
 #else
-        const bool is_window_focused = glfwGetWindowAttrib(window, GLFW_FOCUSED) != 0;
+        const bool is_window_focused = bd->input->viewportData[window].focused;
 #endif
         if (is_window_focused)
         {
             // (Optional) Set OS mouse position from Dear ImGui if requested (rarely used, only when ImGuiConfigFlags_NavEnableSetMousePos is enabled by user)
             // When multi-viewports are enabled, all Dear ImGui positions are same as OS positions.
-            if (io.WantSetMousePos)
-                glfwSetCursorPos(window, (double)(mouse_pos_prev.x - viewport->Pos.x), (double)(mouse_pos_prev.y - viewport->Pos.y));
+            if (io.WantSetMousePos) {
+                theInputManager.executeOn([w = window, x = (double)(mouse_pos_prev.x - viewport->Pos.x), y = (double)(mouse_pos_prev.y - viewport->Pos.y)]() {
+                    glfwSetCursorPos(w, x, y);
+                });
+            }
 
             // (Optional) Fallback to provide mouse position when focused (ImGui_ImplGlfw_CursorPosCallback already provides this when hovered or captured)
-            if (bd->MouseWindow == nullptr)
+            // if (bd->MouseWindow == nullptr) // GLFWIM: this condition broke platform window movement
             {
-                double mouse_x, mouse_y;
-                glfwGetCursorPos(window, &mouse_x, &mouse_y);
+                double mouse_x = bd->input->viewportData[window].cursorX;
+                double mouse_y = bd->input->viewportData[window].cursorY;
                 if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
                 {
                     // Single viewport mode: mouse position in client window coordinates (io.MousePos is (0,0) when the mouse is on the upper-left corner of the app window)
                     // Multi-viewport mode: mouse position in OS absolute coordinates (io.MousePos is (0,0) when the mouse is on the upper-left of the primary monitor)
-                    int window_x, window_y;
-                    glfwGetWindowPos(window, &window_x, &window_y);
+                    int window_x = bd->input->viewportData[window].posX;
+                    int window_y = bd->input->viewportData[window].posY;
                     mouse_x += window_x;
                     mouse_y += window_y;
                 }
@@ -671,9 +701,11 @@ static void ImGui_ImplGlfw_UpdateMouseData()
 #if GLFW_HAS_MOUSE_PASSTHROUGH || (GLFW_HAS_WINDOW_HOVERED && defined(_WIN32))
         const bool window_no_input = (viewport->Flags & ImGuiViewportFlags_NoInputs) != 0;
 #if GLFW_HAS_MOUSE_PASSTHROUGH
-        glfwSetWindowAttrib(window, GLFW_MOUSE_PASSTHROUGH, window_no_input);
+        theInputManager.executeOn([w = window, b = window_no_input]() {
+            glfwSetWindowAttrib(w, GLFW_MOUSE_PASSTHROUGH, b);
+        });
 #endif
-        if (glfwGetWindowAttrib(window, GLFW_HOVERED) && !window_no_input)
+        if (bd->input->viewportData[window].hovered && !window_no_input)
             mouse_viewport_id = viewport->ID;
 #else
         // We cannot use bd->MouseWindow maintained from CursorEnter/Leave callbacks, because it is locked to the window capturing mouse.
@@ -688,7 +720,7 @@ static void ImGui_ImplGlfw_UpdateMouseCursor()
 {
     ImGuiIO& io = ImGui::GetIO();
     ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
-    if ((io.ConfigFlags & ImGuiConfigFlags_NoMouseCursorChange) || glfwGetInputMode(bd->Window, GLFW_CURSOR) == GLFW_CURSOR_DISABLED)
+    if ((io.ConfigFlags & ImGuiConfigFlags_NoMouseCursorChange) || bd->input->inputModeCursor == GLFW_CURSOR_DISABLED)
         return;
 
     ImGuiMouseCursor imgui_cursor = ImGui::GetMouseCursor();
@@ -699,14 +731,22 @@ static void ImGui_ImplGlfw_UpdateMouseCursor()
         if (imgui_cursor == ImGuiMouseCursor_None || io.MouseDrawCursor)
         {
             // Hide OS mouse cursor if imgui is drawing it or if it wants no cursor
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
+            if (bd->input->inputModeCursor != GLFW_CURSOR_HIDDEN) {
+                theInputManager.executeOn([w = window]() {
+                    glfwSetInputMode(w, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
+                });
+            }
         }
         else
         {
             // Show OS mouse cursor
             // FIXME-PLATFORM: Unfocused windows seems to fail changing the mouse cursor with GLFW 3.2, but 3.3 works here.
-            glfwSetCursor(window, bd->MouseCursors[imgui_cursor] ? bd->MouseCursors[imgui_cursor] : bd->MouseCursors[ImGuiMouseCursor_Arrow]);
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            if (bd->input->inputModeCursor != GLFW_CURSOR_NORMAL) {
+                theInputManager.executeOn([w = window, c = bd->MouseCursors[imgui_cursor] ? bd->MouseCursors[imgui_cursor] : bd->MouseCursors[ImGuiMouseCursor_Arrow]]() {
+                    glfwSetCursor(w, c);
+                    glfwSetInputMode(w, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                });
+            }
         }
     }
 }
@@ -719,17 +759,18 @@ static void ImGui_ImplGlfw_UpdateGamepads()
     if ((io.ConfigFlags & ImGuiConfigFlags_NavEnableGamepad) == 0) // FIXME: Technically feeding gamepad shouldn't depend on this now that they are regular inputs.
         return;
 
+    auto bd = ImGui_ImplGlfw_GetBackendData();
     io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
 #if GLFW_HAS_GAMEPAD_API
-    GLFWgamepadstate gamepad;
-    if (!glfwGetGamepadState(GLFW_JOYSTICK_1, &gamepad))
+    if (!bd->input->gamepadStateErrorCode)
         return;
-    #define MAP_BUTTON(KEY_NO, BUTTON_NO, _UNUSED)          do { io.AddKeyEvent(KEY_NO, gamepad.buttons[BUTTON_NO] != 0); } while (0)
-    #define MAP_ANALOG(KEY_NO, AXIS_NO, _UNUSED, V0, V1)    do { float v = gamepad.axes[AXIS_NO]; v = (v - V0) / (V1 - V0); io.AddKeyAnalogEvent(KEY_NO, v > 0.10f, Saturate(v)); } while (0)
+    #define MAP_BUTTON(KEY_NO, BUTTON_NO, _UNUSED)          do { io.AddKeyEvent(KEY_NO, bd->input->gamepadState->buttons[BUTTON_NO] != 0); } while (0)
+    #define MAP_ANALOG(KEY_NO, AXIS_NO, _UNUSED, V0, V1)    do { float v = bd->input->gamepadState->axes[AXIS_NO]; v = (v - V0) / (V1 - V0); io.AddKeyAnalogEvent(KEY_NO, v > 0.10f, Saturate(v)); } while (0)
 #else
-    int axes_count = 0, buttons_count = 0;
-    const float* axes = glfwGetJoystickAxes(GLFW_JOYSTICK_1, &axes_count);
-    const unsigned char* buttons = glfwGetJoystickButtons(GLFW_JOYSTICK_1, &buttons_count);
+    int axes_count = bd->input->joystickAxes.size();
+    int buttons_count = bd->input->joystickButtons.size();
+    const float* axes = bd->input->joystickAxes.data();
+    const unsigned char* buttons = bd->input->joystickButtons.data();
     if (axes_count == 0 || buttons_count == 0)
         return;
     #define MAP_BUTTON(KEY_NO, _UNUSED, BUTTON_NO)          do { io.AddKeyEvent(KEY_NO, (buttons_count > BUTTON_NO && buttons[BUTTON_NO] == GLFW_PRESS)); } while (0)
@@ -768,20 +809,22 @@ static void ImGui_ImplGlfw_UpdateMonitors()
 {
     ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
-    int monitors_count = 0;
-    GLFWmonitor** glfw_monitors = glfwGetMonitors(&monitors_count);
+    const auto& glfw_monitors = bd->input->monitors;
     platform_io.Monitors.resize(0);
-    for (int n = 0; n < monitors_count; n++)
+    for (int n = 0; n < glfw_monitors.size(); n++)
     {
         ImGuiPlatformMonitor monitor;
-        int x, y;
-        glfwGetMonitorPos(glfw_monitors[n], &x, &y);
-        const GLFWvidmode* vid_mode = glfwGetVideoMode(glfw_monitors[n]);
+        int x = glfw_monitors[n].posX;
+        int y = glfw_monitors[n].posY;
+
+        const GLFWvidmode* vid_mode = glfw_monitors[n].videoMode.get();
         monitor.MainPos = monitor.WorkPos = ImVec2((float)x, (float)y);
         monitor.MainSize = monitor.WorkSize = ImVec2((float)vid_mode->width, (float)vid_mode->height);
 #if GLFW_HAS_MONITOR_WORK_AREA
-        int w, h;
-        glfwGetMonitorWorkarea(glfw_monitors[n], &x, &y, &w, &h);
+        x = glfw_monitors[n].workAreaX;
+        y = glfw_monitors[n].workAreaY;
+        int w = glfw_monitors[n].workAreaW;
+        int h = glfw_monitors[n].workAreaH;
         if (w > 0 && h > 0) // Workaround a small GLFW issue reporting zero on monitor changes: https://github.com/glfw/glfw/pull/1761
         {
             monitor.WorkPos = ImVec2((float)x, (float)y);
@@ -790,8 +833,8 @@ static void ImGui_ImplGlfw_UpdateMonitors()
 #endif
 #if GLFW_HAS_PER_MONITOR_DPI
         // Warning: the validity of monitor DPI information on Windows depends on the application DPI awareness settings, which generally needs to be set in the manifest or at runtime.
-        float x_scale, y_scale;
-        glfwGetMonitorContentScale(glfw_monitors[n], &x_scale, &y_scale);
+        float x_scale = glfw_monitors[n].scaleX;
+        float y_scale = glfw_monitors[n].scaleY;
         monitor.DpiScale = x_scale;
 #endif
         platform_io.Monitors.push_back(monitor);
@@ -805,11 +848,18 @@ void ImGui_ImplGlfw_NewFrame()
     ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
     IM_ASSERT(bd != nullptr && "Did you call ImGui_ImplGlfw_InitForXXX()?");
 
+    // Actualize global data
+    auto temp = *bd->input;
+    bd->input = theInputManager.globalInputState.exchange(bd->input, std::memory_order::acquire);
+    if (bd->input->timestamp < temp.timestamp) {
+        *bd->input = temp;
+    }
+
     // Setup display size (every frame to accommodate for window resizing)
-    int w, h;
-    int display_w, display_h;
-    glfwGetWindowSize(bd->Window, &w, &h);
-    glfwGetFramebufferSize(bd->Window, &display_w, &display_h);
+    int w = bd->input->w;
+    int h = bd->input->h;
+    int display_w = bd->input->displayW;
+    int display_h = bd->input->displayH;
     io.DisplaySize = ImVec2((float)w, (float)h);
     if (w > 0 && h > 0)
         io.DisplayFramebufferScale = ImVec2((float)display_w / (float)w, (float)display_h / (float)h);
@@ -833,18 +883,6 @@ void ImGui_ImplGlfw_NewFrame()
 // This is an _advanced_ and _optional_ feature, allowing the backend to create and handle multiple viewports simultaneously.
 // If you are new to dear imgui or creating a new binding for dear imgui, it is recommended that you completely ignore this section first..
 //--------------------------------------------------------------------------------------------------------
-
-// Helper structure we store in the void* RenderUserData field of each ImGuiViewport to easily retrieve our backend data.
-struct ImGui_ImplGlfw_ViewportData
-{
-    GLFWwindow* Window;
-    bool        WindowOwned;
-    int         IgnoreWindowPosEventFrame;
-    int         IgnoreWindowSizeEventFrame;
-
-    ImGui_ImplGlfw_ViewportData()  { Window = nullptr; WindowOwned = false; IgnoreWindowSizeEventFrame = IgnoreWindowPosEventFrame = -1; }
-    ~ImGui_ImplGlfw_ViewportData() { IM_ASSERT(Window == nullptr); }
-};
 
 static void ImGui_ImplGlfw_WindowCloseCallback(GLFWwindow* window)
 {
@@ -890,20 +928,21 @@ static void ImGui_ImplGlfw_WindowSizeCallback(GLFWwindow* window, int, int)
 
 static void ImGui_ImplGlfw_CreateWindow(ImGuiViewport* viewport)
 {
-    ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
-    ImGui_ImplGlfw_ViewportData* vd = IM_NEW(ImGui_ImplGlfw_ViewportData)();
-    viewport->PlatformUserData = vd;
+    auto future = theInputManager.executeOn([&]() {
+        ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
+        ImGui_ImplGlfw_ViewportData* vd = IM_NEW(ImGui_ImplGlfw_ViewportData)();
+        viewport->PlatformUserData = vd;
 
-    // GLFW 3.2 unfortunately always set focus on glfwCreateWindow() if GLFW_VISIBLE is set, regardless of GLFW_FOCUSED
-    // With GLFW 3.3, the hint GLFW_FOCUS_ON_SHOW fixes this problem
-    glfwWindowHint(GLFW_VISIBLE, false);
-    glfwWindowHint(GLFW_FOCUSED, false);
+        // GLFW 3.2 unfortunately always set focus on glfwCreateWindow() if GLFW_VISIBLE is set, regardless of GLFW_FOCUSED
+        // With GLFW 3.3, the hint GLFW_FOCUS_ON_SHOW fixes this problem
+        glfwWindowHint(GLFW_VISIBLE, false);
+        glfwWindowHint(GLFW_FOCUSED, false);
 #if GLFW_HAS_FOCUS_ON_SHOW
-    glfwWindowHint(GLFW_FOCUS_ON_SHOW, false);
- #endif
-    glfwWindowHint(GLFW_DECORATED, (viewport->Flags & ImGuiViewportFlags_NoDecoration) ? false : true);
+        glfwWindowHint(GLFW_FOCUS_ON_SHOW, false);
+#endif
+        glfwWindowHint(GLFW_DECORATED, (viewport->Flags & ImGuiViewportFlags_NoDecoration) ? false : true);
 #if GLFW_HAS_WINDOW_TOPMOST
-    glfwWindowHint(GLFW_FLOATING, (viewport->Flags & ImGuiViewportFlags_TopMost) ? true : false);
+        glfwWindowHint(GLFW_FLOATING, (viewport->Flags & ImGuiViewportFlags_TopMost) ? true : false);
 #endif
     GLFWwindow* share_window = (bd->ClientApi == GlfwClientApi_OpenGL) ? bd->Window : nullptr;
     vd->Window = glfwCreateWindow((int)viewport->Size.x, (int)viewport->Size.y, "No Title Yet", nullptr, share_window);
@@ -914,50 +953,86 @@ static void ImGui_ImplGlfw_CreateWindow(ImGuiViewport* viewport)
 #elif defined(__APPLE__)
     viewport->PlatformHandleRaw = (void*)glfwGetCocoaWindow(vd->Window);
 #endif
-    glfwSetWindowPos(vd->Window, (int)viewport->Pos.x, (int)viewport->Pos.y);
+        glfwSetWindowPos(vd->Window, (int)viewport->Pos.x, (int)viewport->Pos.y);
 
-    // Install GLFW callbacks for secondary viewports
-    glfwSetWindowFocusCallback(vd->Window, ImGui_ImplGlfw_WindowFocusCallback);
-    glfwSetCursorEnterCallback(vd->Window, ImGui_ImplGlfw_CursorEnterCallback);
-    glfwSetCursorPosCallback(vd->Window, ImGui_ImplGlfw_CursorPosCallback);
-    glfwSetMouseButtonCallback(vd->Window, ImGui_ImplGlfw_MouseButtonCallback);
-    glfwSetScrollCallback(vd->Window, ImGui_ImplGlfw_ScrollCallback);
-    glfwSetKeyCallback(vd->Window, ImGui_ImplGlfw_KeyCallback);
-    glfwSetCharCallback(vd->Window, ImGui_ImplGlfw_CharCallback);
-    glfwSetWindowCloseCallback(vd->Window, ImGui_ImplGlfw_WindowCloseCallback);
-    glfwSetWindowPosCallback(vd->Window, ImGui_ImplGlfw_WindowPosCallback);
-    glfwSetWindowSizeCallback(vd->Window, ImGui_ImplGlfw_WindowSizeCallback);
-    if (bd->ClientApi == GlfwClientApi_OpenGL)
-    {
-        glfwMakeContextCurrent(vd->Window);
-        glfwSwapInterval(0);
-    }
+        vd->MyInputManager = new InputManager();
+        auto& im = *vd->MyInputManager;
+        im.initialize(vd->Window);
+
+        // Install GLFW callbacks for secondary viewports
+        im.registerWindowCloseHandler([w = vd->Window]() {
+            ImGui_ImplGlfw_WindowCloseCallback(w);
+        });
+        im.registerWindowFocusHandler([w = vd->Window](bool focused) {
+            ImGui_ImplGlfw_WindowFocusCallback(w, (int)focused);
+        });
+        im.registerCursorMovementHandler([w = vd->Window](CursorMovement mov) {
+            ImGui_ImplGlfw_CursorEnterCallback(w, (int)mov);
+        });
+        im.registerCursorPositionHandler([w = vd->Window](double x, double y) {
+            ImGui_ImplGlfw_CursorPosCallback(w, x, y);
+        });
+        im.registerMouseButtonHandler([w = vd->Window](auto button, auto mods, auto action){
+            ImGui_ImplGlfw_MouseButtonCallback(w, (int)button, (int)action, (int)mods);
+        });
+        im.registerMouseScrollHandler([w = vd->Window](double x, double y){
+            ImGui_ImplGlfw_ScrollCallback(w, x, y);
+        });
+        im.registerKeyHandlerWithKey([w = vd->Window](int key, auto mods, auto action){
+            ImGui_ImplGlfw_KeyCallback(w, key, glfwGetKeyScancode(key), (int)action, (int)mods);
+        });
+        im.registerTextCallback([w = vd->Window](unsigned int codepoint){
+            ImGui_ImplGlfw_CharCallback(w, codepoint);
+        });
+        im.registerWindowMoveHandler([w = vd->Window](int x, int y){
+            ImGui_ImplGlfw_WindowPosCallback(w, x, y);
+        });
+        im.registerWindowResizeHandler([w = vd->Window](int x, int y){
+            ImGui_ImplGlfw_WindowSizeCallback(w, x, y);
+        });
+
+        if (bd->ClientApi == GlfwClientApi_OpenGL)
+        {
+            glfwMakeContextCurrent(vd->Window);
+            glfwSwapInterval(0);
+        }
+
+        theInputManager.registerWindow(vd->Window);
+        theInputManager.registerInputManager(vd->MyInputManager);
+    });
+    future.wait();
 }
 
 static void ImGui_ImplGlfw_DestroyWindow(ImGuiViewport* viewport)
 {
-    ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
-    if (ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData)
-    {
-        if (vd->WindowOwned)
+    auto future = theInputManager.executeOn([&]() {
+        ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
+        if (ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData)
         {
-#if !GLFW_HAS_MOUSE_PASSTHROUGH && GLFW_HAS_WINDOW_HOVERED && defined(_WIN32)
-            HWND hwnd = (HWND)viewport->PlatformHandleRaw;
-            ::RemovePropA(hwnd, "IMGUI_VIEWPORT");
-#endif
+            if (vd->WindowOwned)
+            {
+    #if !GLFW_HAS_MOUSE_PASSTHROUGH && GLFW_HAS_WINDOW_HOVERED && defined(_WIN32)
+                HWND hwnd = (HWND)viewport->PlatformHandleRaw;
+                ::RemovePropA(hwnd, "IMGUI_VIEWPORT");
+    #endif
 
-            // Release any keys that were pressed in the window being destroyed and are still held down,
-            // because we will not receive any release events after window is destroyed.
-            for (int i = 0; i < IM_ARRAYSIZE(bd->KeyOwnerWindows); i++)
-                if (bd->KeyOwnerWindows[i] == vd->Window)
-                    ImGui_ImplGlfw_KeyCallback(vd->Window, i, 0, GLFW_RELEASE, 0); // Later params are only used for main viewport, on which this function is never called.
+                // Release any keys that were pressed in the window being destroyed and are still held down,
+                // because we will not receive any release events after window is destroyed.
+                for (int i = 0; i < IM_ARRAYSIZE(bd->KeyOwnerWindows); i++)
+                    if (bd->KeyOwnerWindows[i] == vd->Window)
+                        ImGui_ImplGlfw_KeyCallback(vd->Window, i, 0, GLFW_RELEASE, 0); // Later params are only used for main viewport, on which this function is never called.
 
-            glfwDestroyWindow(vd->Window);
+                glfwDestroyWindow(vd->Window);
+                theInputManager.removeRegisteredWindow(vd->Window);
+                theInputManager.removeRegisteredInputManager(vd->MyInputManager);
+                delete vd->MyInputManager;
+            }
+            vd->Window = nullptr;
+            IM_DELETE(vd);
         }
-        vd->Window = nullptr;
-        IM_DELETE(vd);
-    }
-    viewport->PlatformUserData = viewport->PlatformHandle = nullptr;
+        viewport->PlatformUserData = viewport->PlatformHandle = nullptr;
+    });
+    future.wait();
 }
 
 // We have submitted https://github.com/glfw/glfw/pull/1568 to allow GLFW to support "transparent inputs".
@@ -1017,14 +1092,17 @@ static void ImGui_ImplGlfw_ShowWindow(ImGuiViewport* viewport)
 #endif
 #endif
 
-    glfwShowWindow(vd->Window);
+    theInputManager.executeOn([w = vd->Window](){
+        glfwShowWindow(w);
+    });
 }
 
 static ImVec2 ImGui_ImplGlfw_GetWindowPos(ImGuiViewport* viewport)
 {
+    auto bd = ImGui_ImplGlfw_GetBackendData();
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
-    int x = 0, y = 0;
-    glfwGetWindowPos(vd->Window, &x, &y);
+    int x = bd->input->viewportData[vd->Window].posX;
+    int y = bd->input->viewportData[vd->Window].posY;
     return ImVec2((float)x, (float)y);
 }
 
@@ -1032,45 +1110,59 @@ static void ImGui_ImplGlfw_SetWindowPos(ImGuiViewport* viewport, ImVec2 pos)
 {
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
     vd->IgnoreWindowPosEventFrame = ImGui::GetFrameCount();
-    glfwSetWindowPos(vd->Window, (int)pos.x, (int)pos.y);
+    theInputManager.executeOn([w = vd->Window, x = (int)pos.x, y = (int)pos.y] {
+        logger.LogInfo(x, " ", y);
+        glfwSetWindowPos(w, x, y);
+    });
 }
 
 static ImVec2 ImGui_ImplGlfw_GetWindowSize(ImGuiViewport* viewport)
 {
+    auto bd = ImGui_ImplGlfw_GetBackendData();
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
-    int w = 0, h = 0;
-    glfwGetWindowSize(vd->Window, &w, &h);
+    int w = bd->input->viewportData[vd->Window].width;
+    int h = bd->input->viewportData[vd->Window].height;
     return ImVec2((float)w, (float)h);
 }
 
 static void ImGui_ImplGlfw_SetWindowSize(ImGuiViewport* viewport, ImVec2 size)
 {
+    auto bd = ImGui_ImplGlfw_GetBackendData();
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
 #if __APPLE__ && !GLFW_HAS_OSX_WINDOW_POS_FIX
     // Native OS windows are positioned from the bottom-left corner on macOS, whereas on other platforms they are
     // positioned from the upper-left corner. GLFW makes an effort to convert macOS style coordinates, however it
     // doesn't handle it when changing size. We are manually moving the window in order for changes of size to be based
     // on the upper-left corner.
-    int x, y, width, height;
-    glfwGetWindowPos(vd->Window, &x, &y);
-    glfwGetWindowSize(vd->Window, &width, &height);
-    glfwSetWindowPos(vd->Window, x, y - height + size.y);
+    int x = bd->input.viewportData[vd->Window].x;
+    int y = bd->input.viewportData[vd->Window].y;
+    int width = bd->input.viewportData[vd->Window].width;
+    int height = bd->input.viewportData[vd->Window].height;
+    theInputManager.executeOn([w = vd->Window, x = x, y = y - height + size.y]{
+        glfwSetWindowPos(w, x, y);
+    });
 #endif
     vd->IgnoreWindowSizeEventFrame = ImGui::GetFrameCount();
-    glfwSetWindowSize(vd->Window, (int)size.x, (int)size.y);
+    theInputManager.executeOn([w = vd->Window, x = (int)size.x, y = (int)size.y]{
+        glfwSetWindowSize(w, x, y);
+    });
 }
 
 static void ImGui_ImplGlfw_SetWindowTitle(ImGuiViewport* viewport, const char* title)
 {
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
-    glfwSetWindowTitle(vd->Window, title);
+    theInputManager.executeOn([w = vd->Window, t = std::string{title}]{
+        glfwSetWindowTitle(w, t.c_str());
+    });
 }
 
 static void ImGui_ImplGlfw_SetWindowFocus(ImGuiViewport* viewport)
 {
 #if GLFW_HAS_FOCUS_WINDOW
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
-    glfwFocusWindow(vd->Window);
+    theInputManager.executeOn([w = vd->Window]{
+        glfwFocusWindow(w);
+    });
 #else
     // FIXME: What are the effect of not having this function? At the moment imgui doesn't actually call SetWindowFocus - we set that up ahead, will answer that question later.
     (void)viewport;
@@ -1079,21 +1171,25 @@ static void ImGui_ImplGlfw_SetWindowFocus(ImGuiViewport* viewport)
 
 static bool ImGui_ImplGlfw_GetWindowFocus(ImGuiViewport* viewport)
 {
+    auto bd = ImGui_ImplGlfw_GetBackendData();
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
-    return glfwGetWindowAttrib(vd->Window, GLFW_FOCUSED) != 0;
+    return bd->input->viewportData[vd->Window].focused != 0;
 }
 
 static bool ImGui_ImplGlfw_GetWindowMinimized(ImGuiViewport* viewport)
 {
+    auto bd = ImGui_ImplGlfw_GetBackendData();
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
-    return glfwGetWindowAttrib(vd->Window, GLFW_ICONIFIED) != 0;
+    return bd->input->viewportData[vd->Window].iconified != 0;
 }
 
 #if GLFW_HAS_WINDOW_ALPHA
 static void ImGui_ImplGlfw_SetWindowAlpha(ImGuiViewport* viewport, float alpha)
 {
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
-    glfwSetWindowOpacity(vd->Window, alpha);
+    theInputManager.executeOn([w = vd->Window, a = alpha]{
+        glfwSetWindowOpacity(w, a);
+    });
 }
 #endif
 
