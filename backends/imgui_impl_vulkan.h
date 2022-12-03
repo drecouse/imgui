@@ -53,7 +53,10 @@ struct ImGui_ImplVulkan_InitInfo
     VkPhysicalDevice                PhysicalDevice;
     VkDevice                        Device;
     uint32_t                        QueueFamily;
-    VkQueue                         Queue;
+    VkResult(*graphicsSubmitFunction)(const VkSubmitInfo& info, VkFence fence);
+    VkResult(*presentSubmitFunction)(const VkPresentInfoKHR& info);
+    VkResult(*waitIdleFunction)();
+ //   VkQueue                         Queue;
     VkPipelineCache                 PipelineCache;
     VkDescriptorPool                DescriptorPool;
     uint32_t                        Subpass;
