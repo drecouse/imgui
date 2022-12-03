@@ -6488,6 +6488,8 @@ void ImGui::RenderWindowDecorations(ImGuiWindow* window, const ImRect& title_bar
                 bg_col |= IM_COL32_A_MASK; // No alpha
                 if (is_docking_transparent_payload)
                     window->Viewport->Alpha *= DOCKING_TRANSPARENT_PAYLOAD_ALPHA;
+                else if ((g.NextWindowData.Flags & ImGuiNextWindowDataFlags_HasBgAlpha) && !(flags & ImGuiWindowFlags_DockNodeHost))
+                    window->Viewport->Alpha = g.NextWindowData.BgAlphaVal;
             }
             else
             {
