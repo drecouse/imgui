@@ -1111,7 +1111,6 @@ static void ImGui_ImplGlfw_SetWindowPos(ImGuiViewport* viewport, ImVec2 pos)
     ImGui_ImplGlfw_ViewportData* vd = (ImGui_ImplGlfw_ViewportData*)viewport->PlatformUserData;
     vd->IgnoreWindowPosEventFrame = ImGui::GetFrameCount();
     theInputManager.executeOn([w = vd->Window, x = (int)pos.x, y = (int)pos.y] {
-        logger.LogInfo(x, " ", y);
         glfwSetWindowPos(w, x, y);
     });
 }
